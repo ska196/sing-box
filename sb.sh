@@ -276,7 +276,7 @@ write_config() (
   jq . > "$CONF_FILE" << CONFIG
 {
   "log": {
-    "level": "warn",
+    "level": "info",
     "timestamp": true
   },
   "dns": {
