@@ -568,7 +568,7 @@ verify_listening() {
 
 public_ip() {
   for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
-    ip=$(curl -fsS --connect-timeout 8 "$url" 2>/dev/null | tr -d '[:space:]') || ip=""
+    ip=$(curl -4 -fsS --connect-timeout 8 "$url" 2>/dev/null | tr -d '[:space:]') || ip=""
     case "$ip" in
       *[!0-9a-fA-F:.]*|"") continue ;;
       *) printf '%s' "$ip"; return 0 ;;
@@ -577,43 +577,55 @@ public_ip() {
   return 1
 }
 
+public_ipv6() {
+  for url in https://api6.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip6=$(curl -6 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') || ip6=""
+    case "$ip6" in
+      *[!0-9a-fA-F:]*|"") continue ;;
+      *:*) printf '%s' "$ip6"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 show_links() {
   load_credentials
-  SERVER=$(public_ip) || SERVER="<your-server-ip>"
+  SERVER_IPV4=$(public_ip) || SERVER_IPV4=""
+  SERVER_IPV6=$(public_ipv6) || SERVER_IPV6=""
+  SERVER="${SERVER_IPV4:-${SERVER_IPV6:-<your-server-ip>}}"
   URI_SERVER=$SERVER
   case "$URI_SERVER" in
     *:*) URI_SERVER="[$URI_SERVER]" ;;
   esac
-  if [ "$INIT" = systemd ]; then
-    LOGS="journalctl -u sing-box -f"
-  else
-    LOGS="tail -f $LOG_FILE"
-  fi
-
   printf '\n%s========================================================%s\n' "$C_BOLD" "$C_RESET"
   printf '%s  sing-box is running%s\n' "$C_BOLD" "$C_RESET"
   printf '%s========================================================%s\n\n' "$C_BOLD" "$C_RESET"
-  printf '  server      %s\n' "$SERVER"
+  if [ -n "$SERVER_IPV4" ]; then
+    printf '  ipv4        %s\n' "$SERVER_IPV4"
+  fi
+  if [ -n "$SERVER_IPV6" ]; then
+    printf '  ipv6        %s\n' "$SERVER_IPV6"
+  fi
   printf '  vless       %s/tcp  (VLESS + REALITY, XTLS-Vision)\n' "$VLESS_PORT"
   printf '  snell v5    %s/tcp  (v4 compatible)\n' "$SNELL_PORT"
   printf '  snell v6    %s/tcp\n' "$SNELL_V6_PORT"
-  printf '  config      %s\n' "$CONF_FILE"
-  printf '  logs        %s\n\n' "$LOGS"
+  printf '\n'
 
   printf '%s  VLESS + REALITY%s\n' "$C_BOLD" "$C_RESET"
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#reality\n\n' \
     "$VLESS_UUID" "$URI_SERVER" "$VLESS_PORT" "$REALITY_DEST" "$REALITY_PUBLIC" "$REALITY_SHORT_ID"
 
   printf '%s  Snell v5 (v4 compatible client)%s\n' "$C_BOLD" "$C_RESET"
-  printf '  nexus = snell, %s, %s, psk=%s, version=4, reuse=true\n\n' \
+  printf '  snell-v5 = snell, %s, %s, psk=%s, version=4, reuse=true\n\n' \
     "$SERVER" "$SNELL_PORT" "$SNELL_PSK"
 
   printf '%s  Snell v6%s\n' "$C_BOLD" "$C_RESET"
-  printf '  nexus-v6 = snell, %s, %s, psk=%s, version=6, reuse=true\n\n' \
+  printf '  snell-v6 = snell, %s, %s, psk=%s, version=6, reuse=true\n\n' \
     "$SERVER" "$SNELL_V6_PORT" "$SNELL_V6_PSK"
 
   printf '%s  Credentials%s\n' "$C_BOLD" "$C_RESET"
   printf '  uuid        %s\n' "$VLESS_UUID"
+  printf '  sni         %s\n' "$REALITY_DEST"
   printf '  public key  %s\n' "$REALITY_PUBLIC"
   printf '  short id    %s\n' "$REALITY_SHORT_ID"
   printf '  snell v5 psk %s\n' "$SNELL_PSK"
