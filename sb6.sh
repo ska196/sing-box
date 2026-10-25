@@ -57,9 +57,9 @@ Installs sing-box and starts three inbounds with random credentials:
   * Snell v6                       on 60003/tcp
 
 Usage:
-  ./sb-ipv6.sh              install (or repair) and start
-  ./sb-ipv6.sh --show       print the share links for an existing install
-  ./sb-ipv6.sh --uninstall  stop and remove everything this script created
+  ./sb6.sh              install (or repair) and start
+  ./sb6.sh --show       print the share links for an existing install
+  ./sb6.sh --uninstall  stop and remove everything this script created
 
 Prefers IPv6 for DNS resolution, outbound domains and client links, with IPv4 fallback.
 Clients must have IPv6 connectivity to use the generated IPv6 server address.
@@ -375,7 +375,7 @@ load_credentials() {
   IFS="$(printf '\t')" read -r VLESS_UUID REALITY_DEST REALITY_SHORT_ID SNELL_PSK SNELL_V6_PSK << SETTINGS
 $client_settings
 SETTINGS
-  [ -s "$REALITY_PUBLIC_FILE" ] || die "missing $REALITY_PUBLIC_FILE; re-run sb-ipv6.sh to generate credentials"
+  [ -s "$REALITY_PUBLIC_FILE" ] || die "missing $REALITY_PUBLIC_FILE; re-run sb6.sh to generate credentials"
   REALITY_PUBLIC=$(cat "$REALITY_PUBLIC_FILE")
 }
 
