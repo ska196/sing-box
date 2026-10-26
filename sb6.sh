@@ -22,7 +22,7 @@ TLS_FINGERPRINT=""
 SNELL_PSK=""
 SNELL_V6_PSK=""
 
-SNI=www.alibabacloud.com
+SNI=www.tencentcloud.com
 REALITY_DEST_PORT=443
 
 BASE_DIR="${SING_BOX_HOME:-/root/sing-box}"
@@ -75,7 +75,7 @@ Prefers IPv6 for DNS resolution, outbound domains and client links, with IPv4 fa
 Clients must have IPv6 connectivity to use the generated IPv6 server address.
 
 Always installs the latest stable sing-box release; re-running upgrades it.
-REALITY, Hysteria2 and TUIC all use www.alibabacloud.com as the SNI.
+REALITY, Hysteria2 and TUIC all use www.tencentcloud.com as the SNI.
 Hysteria2 and TUIC use a self-signed certificate; clients skip verification.
 Each install generates fresh credentials; update clients after re-running.
 

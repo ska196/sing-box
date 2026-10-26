@@ -10,7 +10,7 @@ Install the latest stable sing-box on Debian, Ubuntu, or Alpine. Supports system
 | Snell v5 (v4-compatible clients) | 60004/tcp |
 | Snell v6 | 60005/tcp |
 
-REALITY, Hysteria2, and TUIC all use `www.alibabacloud.com` as the SNI. Hysteria2 and TUIC use a self-signed certificate, so clients skip certificate verification.
+REALITY, Hysteria2, and TUIC all use `www.tencentcloud.com` as the SNI. Hysteria2 and TUIC use a self-signed certificate, so clients skip certificate verification.
 
 ## Install
 
