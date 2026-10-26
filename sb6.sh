@@ -6,17 +6,23 @@ SING_BOX_VERSION=""
 SERVICE_NAME=sing-box
 
 VLESS_PORT=60001
-SNELL_PORT=60002
-SNELL_V6_PORT=60003
+HY2_PORT=60002
+TUIC_PORT=60003
+SNELL_PORT=60004
+SNELL_V6_PORT=60005
 
 VLESS_UUID=""
 REALITY_PRIVATE=""
 REALITY_PUBLIC=""
 REALITY_SHORT_ID=""
+HY2_PASSWORD=""
+TUIC_UUID=""
+TUIC_PASSWORD=""
+TLS_FINGERPRINT=""
 SNELL_PSK=""
 SNELL_V6_PSK=""
 
-REALITY_DEST=""
+SNI=www.alibabacloud.com
 REALITY_DEST_PORT=443
 
 BASE_DIR="${SING_BOX_HOME:-/root/sing-box}"
@@ -33,6 +39,8 @@ LOG_KEEP_BYTES=$((5 * 1024 * 1024))
 
 CONF_FILE="$CONF_DIR/config.json"
 REALITY_PUBLIC_FILE="$CONF_DIR/reality-public.key"
+TLS_CERT_FILE="$CONF_DIR/tls-cert.pem"
+TLS_KEY_FILE="$CONF_DIR/tls-key.pem"
 
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
   C_RESET=$(printf '\033[0m'); C_OK=$(printf '\033[32m')
@@ -51,10 +59,12 @@ usage() {
   cat << 'USAGE'
 IPv6-first sing-box installer for Alpine Linux and Debian/Ubuntu.
 
-Installs sing-box and starts three inbounds with random credentials:
+Installs sing-box and starts five inbounds with random credentials:
   * VLESS + REALITY (XTLS-Vision)  on 60001/tcp
-  * Snell v5 (v4 compatible)        on 60002/tcp
-  * Snell v6                       on 60003/tcp
+  * Hysteria2                      on 60002/udp
+  * TUIC v5                        on 60003/udp
+  * Snell v5 (v4 compatible)       on 60004/tcp
+  * Snell v6                       on 60005/tcp
 
 Usage:
   ./sb6.sh              install (or repair) and start
@@ -65,7 +75,8 @@ Prefers IPv6 for DNS resolution, outbound domains and client links, with IPv4 fa
 Clients must have IPv6 connectivity to use the generated IPv6 server address.
 
 Always installs the latest stable sing-box release; re-running upgrades it.
-Each install randomly selects one REALITY domain and saves it in the config.
+REALITY, Hysteria2 and TUIC all use www.alibabacloud.com as the SNI.
+Hysteria2 and TUIC use a self-signed certificate; clients skip verification.
 Each install generates fresh credentials; update clients after re-running.
 
 State lives under /root/sing-box (binary, config, logs, pids).
@@ -243,20 +254,6 @@ ensure_dirs() {
   chmod 0755 "$BASE_DIR"
 }
 
-choose_reality_dest() {
-  set -- www.apple.com www.icloud.com www.bing.com www.nvidia.com \
-    www.amd.com addons.mozilla.org aws.amazon.com www.tesla.com www.bmw.com
-  # Reject the incomplete range so each domain has the same chance.
-  while :; do
-    random_hex=$(openssl rand -hex 2) || die "could not randomly select a REALITY domain"
-    random_value=$((0x$random_hex))
-    [ "$random_value" -lt "$((65536 - 65536 % $#))" ] && break
-  done
-  shift "$((random_value % $#))"
-  REALITY_DEST=$1
-  ok "selected REALITY domain: $REALITY_DEST"
-}
-
 generate_credentials() {
   log "generating fresh credentials"
   VLESS_UUID=$("$BIN_PATH" generate uuid) || die "could not generate VLESS UUID"
@@ -265,6 +262,9 @@ generate_credentials() {
   REALITY_PUBLIC=$(printf '%s\n' "$reality_keypair" | awk '/^PublicKey:/{print $2}')
   [ -n "$VLESS_UUID" ] && [ -n "$REALITY_PRIVATE" ] && [ -n "$REALITY_PUBLIC" ] || die "invalid generated credentials"
   REALITY_SHORT_ID=$(openssl rand -hex 8) || die "could not generate REALITY short ID"
+  HY2_PASSWORD=$(openssl rand -hex 16) || die "could not generate Hysteria2 password"
+  TUIC_UUID=$("$BIN_PATH" generate uuid) || die "could not generate TUIC UUID"
+  TUIC_PASSWORD=$(openssl rand -hex 16) || die "could not generate TUIC password"
   SNELL_PSK=$(openssl rand -hex 32) || die "could not generate Snell v5 key"
   SNELL_V6_PSK=$(openssl rand -hex 32) || die "could not generate Snell v6 key"
 }
@@ -272,8 +272,12 @@ generate_credentials() {
 write_config() (
   umask 077
   # Set permissions before writing, including when replacing an existing file.
-  touch "$CONF_FILE" "$REALITY_PUBLIC_FILE"
-  chmod 600 "$CONF_FILE" "$REALITY_PUBLIC_FILE"
+  touch "$CONF_FILE" "$REALITY_PUBLIC_FILE" "$TLS_CERT_FILE" "$TLS_KEY_FILE"
+  chmod 600 "$CONF_FILE" "$REALITY_PUBLIC_FILE" "$TLS_CERT_FILE" "$TLS_KEY_FILE"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$TLS_KEY_FILE" -out "$TLS_CERT_FILE" -days 3650 \
+    -subj "/CN=$SNI" -addext "subjectAltName=DNS:$SNI" >/dev/null 2>&1 \
+    || die "could not generate the TLS certificate"
   # Generated UUIDs, hex keys and base64url keys are safe in JSON strings.
   # Feed credentials through stdin so they do not appear in process arguments.
   jq . > "$CONF_FILE" << CONFIG
@@ -307,11 +311,11 @@ write_config() (
       ],
       "tls": {
         "enabled": true,
-        "server_name": "$REALITY_DEST",
+        "server_name": "$SNI",
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "$REALITY_DEST",
+            "server": "$SNI",
             "server_port": 443
           },
           "private_key": "$REALITY_PRIVATE",
@@ -325,10 +329,54 @@ write_config() (
       }
     },
     {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 60002,
+      "users": [
+        {
+          "name": "default",
+          "password": "$HY2_PASSWORD"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "alpn": [
+          "h3"
+        ],
+        "certificate_path": "$TLS_CERT_FILE",
+        "key_path": "$TLS_KEY_FILE"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": 60003,
+      "users": [
+        {
+          "name": "default",
+          "uuid": "$TUIC_UUID",
+          "password": "$TUIC_PASSWORD"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "alpn": [
+          "h3"
+        ],
+        "certificate_path": "$TLS_CERT_FILE",
+        "key_path": "$TLS_KEY_FILE"
+      }
+    },
+    {
       "type": "snell",
       "tag": "snell-in",
       "listen": "::",
-      "listen_port": 60002,
+      "listen_port": 60004,
       "version": 5,
       "psk": "$SNELL_PSK"
     },
@@ -336,7 +384,7 @@ write_config() (
       "type": "snell",
       "tag": "snell-v6-in",
       "listen": "::",
-      "listen_port": 60003,
+      "listen_port": 60005,
       "version": 6,
       "psk": "$SNELL_V6_PSK",
       "mode": "default"
@@ -364,33 +412,43 @@ load_credentials() {
   command -v jq >/dev/null 2>&1 || die "jq is required to read the saved configuration"
   client_settings=$(jq -er '
     (.inbounds[] | select(.type == "vless")) as $vless |
+    (.inbounds[] | select(.type == "hysteria2")) as $hy2 |
+    (.inbounds[] | select(.type == "tuic")) as $tuic |
     (.inbounds[] | select(.type == "snell" and .version == 5)) as $snell |
     (.inbounds[] | select(.type == "snell" and .version == 6)) as $snell_v6 |
     [$vless.users[0].uuid, $vless.tls.server_name,
-     $vless.tls.reality.short_id[0], $snell.psk, $snell_v6.psk] |
+     $vless.tls.reality.short_id[0], $hy2.users[0].password,
+     $tuic.users[0].uuid, $tuic.users[0].password,
+     $snell.psk, $snell_v6.psk] |
     if all(.[]; type == "string" and length > 0) then @tsv
     else error("missing client settings") end
   ' "$CONF_FILE") || die "could not read credentials from $CONF_FILE"
   [ -n "$client_settings" ] || die "no client credentials found in $CONF_FILE"
-  IFS="$(printf '\t')" read -r VLESS_UUID REALITY_DEST REALITY_SHORT_ID SNELL_PSK SNELL_V6_PSK << SETTINGS
+  IFS="$(printf '\t')" read -r VLESS_UUID SNI REALITY_SHORT_ID HY2_PASSWORD \
+    TUIC_UUID TUIC_PASSWORD SNELL_PSK SNELL_V6_PSK << SETTINGS
 $client_settings
 SETTINGS
   [ -s "$REALITY_PUBLIC_FILE" ] || die "missing $REALITY_PUBLIC_FILE; re-run sb6.sh to generate credentials"
   REALITY_PUBLIC=$(cat "$REALITY_PUBLIC_FILE")
+  [ -s "$TLS_CERT_FILE" ] || die "missing $TLS_CERT_FILE; re-run sb6.sh to generate credentials"
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to read the TLS certificate"
+  TLS_FINGERPRINT=$(openssl x509 -in "$TLS_CERT_FILE" -noout -fingerprint -sha256 \
+    | sed -e 's/.*=//' -e 's/://g' | tr 'A-F' 'a-f')
+  [ -n "$TLS_FINGERPRINT" ] || die "could not read the fingerprint of $TLS_CERT_FILE"
 }
 
 check_reality_dest() {
-  log "checking REALITY destination $REALITY_DEST:$REALITY_DEST_PORT"
+  log "checking REALITY destination $SNI:$REALITY_DEST_PORT"
   if command -v timeout >/dev/null 2>&1; then
-    REALITY_CHECK=$(timeout 10 openssl s_client -connect "$REALITY_DEST:$REALITY_DEST_PORT" \
-        -servername "$REALITY_DEST" -alpn h2 </dev/null 2>/dev/null || true)
+    REALITY_CHECK=$(timeout 10 openssl s_client -connect "$SNI:$REALITY_DEST_PORT" \
+        -servername "$SNI" -alpn h2 </dev/null 2>/dev/null || true)
   else
-    REALITY_CHECK=$(openssl s_client -connect "$REALITY_DEST:$REALITY_DEST_PORT" \
-        -servername "$REALITY_DEST" -alpn h2 </dev/null 2>/dev/null || true)
+    REALITY_CHECK=$(openssl s_client -connect "$SNI:$REALITY_DEST_PORT" \
+        -servername "$SNI" -alpn h2 </dev/null 2>/dev/null || true)
   fi
   case "$REALITY_CHECK" in
     *TLSv1.3*) ok "destination speaks TLS 1.3" ;;
-    *) warn "could not confirm TLS 1.3 from $REALITY_DEST -- REALITY clients may fail" ;;
+    *) warn "could not confirm TLS 1.3 from $SNI -- REALITY clients may fail" ;;
   esac
 }
 
@@ -548,13 +606,20 @@ start_service() {
 verify_listening() {
   sleep 2
   failed=0
-  for p in "$VLESS_PORT" "$SNELL_PORT" "$SNELL_V6_PORT"; do
+  for p in "$VLESS_PORT/tcp" "$HY2_PORT/udp" "$TUIC_PORT/udp" "$SNELL_PORT/tcp" "$SNELL_V6_PORT/tcp"; do
+    port=${p%/*}
+    proto=${p#*/}
     if command -v ss >/dev/null 2>&1; then
-      ss -lnt 2>/dev/null | grep -qE "[:.]$p[[:space:]]" || failed=1
+      if [ "$proto" = tcp ]; then ss_flags=-lnt; else ss_flags=-lnu; fi
+      ss "$ss_flags" 2>/dev/null | grep -qE "[:.]$port[[:space:]]" || failed=1
     elif command -v netstat >/dev/null 2>&1; then
-      netstat -an 2>/dev/null | grep -qE "[:.]$p[[:space:]]" || failed=1
+      netstat -an 2>/dev/null | grep -qE "^$proto.*[:.]$port[[:space:]]" || failed=1
     elif command -v lsof >/dev/null 2>&1; then
-      lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 || failed=1
+      if [ "$proto" = tcp ]; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || failed=1
+      else
+        lsof -nP -iUDP:"$port" >/dev/null 2>&1 || failed=1
+      fi
     fi
   done
   if [ "$failed" -eq 1 ]; then
@@ -566,7 +631,7 @@ verify_listening() {
     fi
     exit 1
   fi
-  ok "listening on $VLESS_PORT, $SNELL_PORT and $SNELL_V6_PORT"
+  ok "listening on $VLESS_PORT/tcp, $HY2_PORT/udp, $TUIC_PORT/udp, $SNELL_PORT/tcp and $SNELL_V6_PORT/tcp"
 }
 
 public_ip() {
@@ -610,13 +675,23 @@ show_links() {
     printf '  ipv4        %s\n' "$SERVER_IPV4"
   fi
   printf '  vless       %s/tcp  (VLESS + REALITY, XTLS-Vision)\n' "$VLESS_PORT"
+  printf '  hysteria2   %s/udp\n' "$HY2_PORT"
+  printf '  tuic v5     %s/udp\n' "$TUIC_PORT"
   printf '  snell v5    %s/tcp  (v4 compatible)\n' "$SNELL_PORT"
   printf '  snell v6    %s/tcp\n' "$SNELL_V6_PORT"
   printf '\n'
 
   printf '%s  VLESS + REALITY%s\n' "$C_BOLD" "$C_RESET"
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#reality\n\n' \
-    "$VLESS_UUID" "$URI_SERVER" "$VLESS_PORT" "$REALITY_DEST" "$REALITY_PUBLIC" "$REALITY_SHORT_ID"
+    "$VLESS_UUID" "$URI_SERVER" "$VLESS_PORT" "$SNI" "$REALITY_PUBLIC" "$REALITY_SHORT_ID"
+
+  printf '%s  Hysteria2%s\n' "$C_BOLD" "$C_RESET"
+  printf 'hysteria2://%s@%s:%s?sni=%s&alpn=h3&insecure=1&pinSHA256=%s#hysteria2\n\n' \
+    "$HY2_PASSWORD" "$URI_SERVER" "$HY2_PORT" "$SNI" "$TLS_FINGERPRINT"
+
+  printf '%s  TUIC v5%s\n' "$C_BOLD" "$C_RESET"
+  printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#tuic\n\n' \
+    "$TUIC_UUID" "$TUIC_PASSWORD" "$URI_SERVER" "$TUIC_PORT" "$SNI"
 
   printf '%s  Snell v5 (v4 compatible client)%s\n' "$C_BOLD" "$C_RESET"
   printf '  snell-v5 = snell, %s, %s, psk=%s, version=4, reuse=true\n\n' \
@@ -628,9 +703,13 @@ show_links() {
 
   printf '%s  Credentials%s\n' "$C_BOLD" "$C_RESET"
   printf '  uuid        %s\n' "$VLESS_UUID"
-  printf '  sni         %s\n' "$REALITY_DEST"
+  printf '  sni         %s\n' "$SNI"
   printf '  public key  %s\n' "$REALITY_PUBLIC"
   printf '  short id    %s\n' "$REALITY_SHORT_ID"
+  printf '  hy2 password %s\n' "$HY2_PASSWORD"
+  printf '  tuic uuid   %s\n' "$TUIC_UUID"
+  printf '  tuic password %s\n' "$TUIC_PASSWORD"
+  printf '  cert sha256 %s\n' "$TLS_FINGERPRINT"
   printf '  snell v5 psk %s\n' "$SNELL_PSK"
   printf '  snell v6 psk %s\n\n' "$SNELL_V6_PSK"
 }
@@ -669,7 +748,6 @@ do_install() {
   ensure_deps
   ensure_binary
   ensure_dirs
-  choose_reality_dest
   generate_credentials
 
   log "writing configuration to $CONF_FILE"

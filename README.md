@@ -2,11 +2,15 @@
 
 Install the latest stable sing-box on Debian, Ubuntu, or Alpine. Supports systemd, OpenRC, and background mode for containers without an init system.
 
-| Protocol | TCP port |
+| Protocol | Port |
 | --- | --- |
-| VLESS + REALITY + XTLS Vision | 60001 |
-| Snell v5 (v4-compatible clients) | 60002 |
-| Snell v6 | 60003 |
+| VLESS + REALITY + XTLS Vision | 60001/tcp |
+| Hysteria2 | 60002/udp |
+| TUIC v5 | 60003/udp |
+| Snell v5 (v4-compatible clients) | 60004/tcp |
+| Snell v6 | 60005/tcp |
+
+REALITY, Hysteria2, and TUIC all use `www.alibabacloud.com` as the SNI. Hysteria2 and TUIC use a self-signed certificate, so clients skip certificate verification.
 
 ## Install
 
