@@ -16,11 +16,7 @@ REALITY_PRIVATE=""
 REALITY_PUBLIC=""
 REALITY_SHORT_ID=""
 HY2_PASSWORD=""
-TUIC_UUID=""
-TUIC_PASSWORD=""
-TLS_FINGERPRINT=""
 SNELL_PSK=""
-SNELL_V6_PSK=""
 
 SNI=www.tencentcloud.com
 REALITY_DEST_PORT=443
@@ -263,10 +259,7 @@ generate_credentials() {
   [ -n "$VLESS_UUID" ] && [ -n "$REALITY_PRIVATE" ] && [ -n "$REALITY_PUBLIC" ] || die "invalid generated credentials"
   REALITY_SHORT_ID=$(openssl rand -hex 8) || die "could not generate REALITY short ID"
   HY2_PASSWORD=$(openssl rand -hex 16) || die "could not generate Hysteria2 password"
-  TUIC_UUID=$("$BIN_PATH" generate uuid) || die "could not generate TUIC UUID"
-  TUIC_PASSWORD=$(openssl rand -hex 16) || die "could not generate TUIC password"
-  SNELL_PSK=$(openssl rand -hex 32) || die "could not generate Snell v5 key"
-  SNELL_V6_PSK=$(openssl rand -hex 32) || die "could not generate Snell v6 key"
+  SNELL_PSK=$(openssl rand -hex 32) || die "could not generate Snell key"
 }
 
 write_config() (
@@ -357,8 +350,8 @@ write_config() (
       "users": [
         {
           "name": "default",
-          "uuid": "$TUIC_UUID",
-          "password": "$TUIC_PASSWORD"
+          "uuid": "$VLESS_UUID",
+          "password": "$HY2_PASSWORD"
         }
       ],
       "congestion_control": "bbr",
@@ -386,7 +379,7 @@ write_config() (
       "listen": "::",
       "listen_port": 60005,
       "version": 6,
-      "psk": "$SNELL_V6_PSK",
+      "psk": "$SNELL_PSK",
       "mode": "default"
     }
   ],
@@ -413,28 +406,18 @@ load_credentials() {
   client_settings=$(jq -er '
     (.inbounds[] | select(.type == "vless")) as $vless |
     (.inbounds[] | select(.type == "hysteria2")) as $hy2 |
-    (.inbounds[] | select(.type == "tuic")) as $tuic |
     (.inbounds[] | select(.type == "snell" and .version == 5)) as $snell |
-    (.inbounds[] | select(.type == "snell" and .version == 6)) as $snell_v6 |
     [$vless.users[0].uuid, $vless.tls.server_name,
-     $vless.tls.reality.short_id[0], $hy2.users[0].password,
-     $tuic.users[0].uuid, $tuic.users[0].password,
-     $snell.psk, $snell_v6.psk] |
+     $vless.tls.reality.short_id[0], $hy2.users[0].password, $snell.psk] |
     if all(.[]; type == "string" and length > 0) then @tsv
     else error("missing client settings") end
   ' "$CONF_FILE") || die "could not read credentials from $CONF_FILE"
   [ -n "$client_settings" ] || die "no client credentials found in $CONF_FILE"
-  IFS="$(printf '\t')" read -r VLESS_UUID SNI REALITY_SHORT_ID HY2_PASSWORD \
-    TUIC_UUID TUIC_PASSWORD SNELL_PSK SNELL_V6_PSK << SETTINGS
+  IFS="$(printf '\t')" read -r VLESS_UUID SNI REALITY_SHORT_ID HY2_PASSWORD SNELL_PSK << SETTINGS
 $client_settings
 SETTINGS
   [ -s "$REALITY_PUBLIC_FILE" ] || die "missing $REALITY_PUBLIC_FILE; re-run sb6.sh to generate credentials"
   REALITY_PUBLIC=$(cat "$REALITY_PUBLIC_FILE")
-  [ -s "$TLS_CERT_FILE" ] || die "missing $TLS_CERT_FILE; re-run sb6.sh to generate credentials"
-  command -v openssl >/dev/null 2>&1 || die "openssl is required to read the TLS certificate"
-  TLS_FINGERPRINT=$(openssl x509 -in "$TLS_CERT_FILE" -noout -fingerprint -sha256 \
-    | sed -e 's/.*=//' -e 's/://g' | tr 'A-F' 'a-f')
-  [ -n "$TLS_FINGERPRINT" ] || die "could not read the fingerprint of $TLS_CERT_FILE"
 }
 
 check_reality_dest() {
@@ -656,6 +639,13 @@ public_ipv6() {
   return 1
 }
 
+print_section() {
+  section_head="-- $1  $2 "
+  section_fill=$((56 - ${#section_head}))
+  section_rule=$(printf '%s' '--------------------------------------------------------' | cut -c1-"$section_fill")
+  printf '\n%s%s%s%s\n' "$C_BOLD" "$section_head" "$section_rule" "$C_RESET"
+}
+
 show_links() {
   load_credentials
   SERVER_IPV6=$(public_ipv6) || SERVER_IPV6=""
@@ -667,51 +657,46 @@ show_links() {
   esac
   printf '\n%s========================================================%s\n' "$C_BOLD" "$C_RESET"
   printf '%s  sing-box is running%s\n' "$C_BOLD" "$C_RESET"
-  printf '%s========================================================%s\n\n' "$C_BOLD" "$C_RESET"
+  printf '%s========================================================%s\n' "$C_BOLD" "$C_RESET"
   if [ -n "$SERVER_IPV6" ]; then
     printf '  ipv6        %s\n' "$SERVER_IPV6"
   fi
   if [ -n "$SERVER_IPV4" ]; then
     printf '  ipv4        %s\n' "$SERVER_IPV4"
   fi
-  printf '  vless       %s/tcp  (VLESS + REALITY, XTLS-Vision)\n' "$VLESS_PORT"
-  printf '  hysteria2   %s/udp\n' "$HY2_PORT"
-  printf '  tuic v5     %s/udp\n' "$TUIC_PORT"
-  printf '  snell v5    %s/tcp  (v4 compatible)\n' "$SNELL_PORT"
-  printf '  snell v6    %s/tcp\n' "$SNELL_V6_PORT"
-  printf '\n'
 
-  printf '%s  VLESS + REALITY%s\n' "$C_BOLD" "$C_RESET"
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#reality\n\n' \
+  print_section "VLESS + REALITY" "$VLESS_PORT/tcp"
+  printf '  vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#reality\n' \
     "$VLESS_UUID" "$URI_SERVER" "$VLESS_PORT" "$SNI" "$REALITY_PUBLIC" "$REALITY_SHORT_ID"
-
-  printf '%s  Hysteria2%s\n' "$C_BOLD" "$C_RESET"
-  printf 'hysteria2://%s@%s:%s?sni=%s&alpn=h3&insecure=1&pinSHA256=%s#hysteria2\n\n' \
-    "$HY2_PASSWORD" "$URI_SERVER" "$HY2_PORT" "$SNI" "$TLS_FINGERPRINT"
-
-  printf '%s  TUIC v5%s\n' "$C_BOLD" "$C_RESET"
-  printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#tuic\n\n' \
-    "$TUIC_UUID" "$TUIC_PASSWORD" "$URI_SERVER" "$TUIC_PORT" "$SNI"
-
-  printf '%s  Snell v5 (v4 compatible client)%s\n' "$C_BOLD" "$C_RESET"
-  printf '  snell-v5 = snell, %s, %s, psk=%s, version=4, reuse=true\n\n' \
-    "$SERVER" "$SNELL_PORT" "$SNELL_PSK"
-
-  printf '%s  Snell v6%s\n' "$C_BOLD" "$C_RESET"
-  printf '  snell-v6 = snell, %s, %s, psk=%s, version=6, reuse=true\n\n' \
-    "$SERVER" "$SNELL_V6_PORT" "$SNELL_V6_PSK"
-
-  printf '%s  Credentials%s\n' "$C_BOLD" "$C_RESET"
   printf '  uuid        %s\n' "$VLESS_UUID"
-  printf '  sni         %s\n' "$SNI"
   printf '  public key  %s\n' "$REALITY_PUBLIC"
   printf '  short id    %s\n' "$REALITY_SHORT_ID"
-  printf '  hy2 password %s\n' "$HY2_PASSWORD"
-  printf '  tuic uuid   %s\n' "$TUIC_UUID"
-  printf '  tuic password %s\n' "$TUIC_PASSWORD"
-  printf '  cert sha256 %s\n' "$TLS_FINGERPRINT"
-  printf '  snell v5 psk %s\n' "$SNELL_PSK"
-  printf '  snell v6 psk %s\n\n' "$SNELL_V6_PSK"
+  printf '  sni         %s\n' "$SNI"
+
+  print_section "Hysteria2" "$HY2_PORT/udp"
+  printf '  hysteria2://%s@%s:%s?sni=%s&alpn=h3&insecure=1#hysteria2\n' \
+    "$HY2_PASSWORD" "$URI_SERVER" "$HY2_PORT" "$SNI"
+  printf '  password    %s\n' "$HY2_PASSWORD"
+  printf '  sni         %s\n' "$SNI"
+
+  print_section "TUIC v5" "$TUIC_PORT/udp"
+  printf '  tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#tuic\n' \
+    "$VLESS_UUID" "$HY2_PASSWORD" "$URI_SERVER" "$TUIC_PORT" "$SNI"
+  printf '  uuid        %s\n' "$VLESS_UUID"
+  printf '  password    %s\n' "$HY2_PASSWORD"
+  printf '  sni         %s\n' "$SNI"
+
+  print_section "Snell v5" "$SNELL_PORT/tcp"
+  printf '  snell-v5 = snell, %s, %s, psk=%s, version=4, reuse=true\n' \
+    "$SERVER" "$SNELL_PORT" "$SNELL_PSK"
+  printf '  psk         %s\n' "$SNELL_PSK"
+
+  print_section "Snell v6" "$SNELL_V6_PORT/tcp"
+  printf '  snell-v6 = snell, %s, %s, psk=%s, version=6, reuse=true\n' \
+    "$SERVER" "$SNELL_V6_PORT" "$SNELL_PSK"
+  printf '  psk         %s\n' "$SNELL_PSK"
+
+  printf '\n%s========================================================%s\n\n' "$C_BOLD" "$C_RESET"
 }
 
 uninstall() {
