@@ -14,11 +14,15 @@ REALITY, Hysteria2, and TUIC all use `www.tencentcloud.com` as the SNI. Hysteria
 
 ## Install
 
-Run as root
+### IPv4-only host
 
-```sh
 curl -fsSL https://raw.githubusercontent.com/ska196/sing-box/main/sb.sh -o sb.sh && sh sb.sh
-```
+
+### IPv4 + IPv6 or IPv6-only host (recommended)
+
+curl -fsSL https://raw.githubusercontent.com/ska196/sing-box/main/sb6.sh -o sb6.sh && sh sb6.sh
+
+This setup is recommended because it is less likely to be blocked.
 
 ## Usage
 
