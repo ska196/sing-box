@@ -80,6 +80,7 @@ Set SING_BOX_HOME to put it somewhere else.
 
 Supports both systemd (Debian/Ubuntu) and OpenRC (Alpine); falls back to a
 background process when neither init is present (e.g. inside a container).
+sing-box is restarted automatically if it exits or is killed (e.g. by OOM).
 USAGE
 }
 
@@ -478,7 +479,13 @@ stop_existing() {
     openrc)  rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true ;;
   esac
   if [ -f "$PID_FILE" ]; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    old_pid=$(cat "$PID_FILE")
+    kill "$old_pid" 2>/dev/null || true
+    i=0
+    while kill -0 "$old_pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+      sleep 1
+      i=$((i + 1))
+    done
     rm -f "$PID_FILE"
   fi
   stop_rotator
@@ -492,12 +499,13 @@ install_service() {
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=$BIN_PATH run -c $CONF_FILE
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=3s
 LimitNOFILE=infinity
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -512,7 +520,6 @@ UNIT
     openrc)
       sed -e "s|@BIN@|$BIN_PATH|g" \
           -e "s|@CONF@|$CONF_FILE|g" \
-          -e "s|@PID@|$PID_FILE|g" \
           -e "s|@LOG@|$LOG_FILE|g" \
           -e "s|@RPID@|$ROTATOR_PID_FILE|g" \
           -e "s|@RMAX@|$LOG_MAX_BYTES|g" \
@@ -522,12 +529,13 @@ UNIT
 name="sing-box"
 description="sing-box proxy server"
 
+supervisor="supervise-daemon"
 command="@BIN@"
 command_args="run -c @CONF@"
-command_background="yes"
-pidfile="@PID@"
 output_log="@LOG@"
 error_log="@LOG@"
+respawn_delay=3
+respawn_max=0
 
 rotator_pid="@RPID@"
 
@@ -579,7 +587,15 @@ start_service() {
     systemd) systemctl start "$SERVICE_NAME" ;;
     openrc)  rc-service "$SERVICE_NAME" start >/dev/null 2>&1 ;;
     none)
-      nohup "$BIN_PATH" run -c "$CONF_FILE" >>"$LOG_FILE" 2>&1 &
+      nohup sh -c '
+        trap "kill \$child 2>/dev/null; wait \$child; exit 0" TERM
+        while :; do
+          "$1" run -c "$2" >>"$3" 2>&1 &
+          child=$!
+          wait "$child"
+          sleep 3
+        done
+      ' sing-box-supervisor "$BIN_PATH" "$CONF_FILE" "$LOG_FILE" >/dev/null 2>&1 &
       echo $! > "$PID_FILE"
       start_rotator
       ;;
