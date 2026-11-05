@@ -93,7 +93,7 @@ Clients must have IPv6 connectivity to use the generated IPv6 server address.
 Always installs the latest stable sing-box release; re-running upgrades it.
 REALITY, Hysteria2 and TUIC all use www.tencentcloud.com as the SNI.
 Hysteria2 and TUIC use a self-signed certificate; clients skip verification.
-Each install generates fresh credentials; update clients after re-running.
+Re-running keeps the existing credentials; --uninstall removes them.
 
 State lives under /root/sing-box (binary, config, logs, pids).
 Set SING_BOX_HOME to put it somewhere else.
@@ -273,7 +273,30 @@ ensure_dirs() {
   chmod 0755 "$BASE_DIR"
 }
 
+# Clients keep working after a re-run because the saved credentials are written back.
+reuse_credentials() {
+  [ -s "$CONF_FILE" ] && [ -s "$REALITY_PUBLIC_FILE" ] || return 1
+  saved_settings=$(jq -er '
+    (.inbounds[] | select(.type == "vless")) as $vless |
+    (.inbounds[] | select(.type == "hysteria2")) as $hy2 |
+    (.inbounds[] | select(.type == "snell" and .version == 5)) as $snell |
+    [$vless.users[0].uuid, $vless.tls.reality.private_key,
+     $vless.tls.reality.short_id[0], $hy2.users[0].password, $snell.psk] |
+    if all(.[]; type == "string" and length > 0) then @tsv
+    else error("missing saved credentials") end
+  ' "$CONF_FILE" 2>/dev/null) || return 1
+  IFS="$(printf '\t')" read -r VLESS_UUID REALITY_PRIVATE REALITY_SHORT_ID HY2_PASSWORD SNELL_PSK << SAVED
+$saved_settings
+SAVED
+  REALITY_PUBLIC=$(cat "$REALITY_PUBLIC_FILE")
+}
+
 generate_credentials() {
+  if reuse_credentials; then
+    ok "keeping existing credentials"
+    return 0
+  fi
+  [ ! -s "$CONF_FILE" ] || warn "could not read the existing credentials; clients must be updated"
   log "generating fresh credentials"
   VLESS_UUID=$("$BIN_PATH" generate uuid) || die "could not generate VLESS UUID"
   reality_keypair=$("$BIN_PATH" generate reality-keypair) || die "could not generate REALITY key pair"
@@ -299,7 +322,7 @@ write_config() (
   jq . > "$CONF_FILE" << CONFIG
 {
   "log": {
-    "level": "warn",
+    "level": "info",
     "timestamp": true
   },
   "dns": {

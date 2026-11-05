@@ -36,7 +36,7 @@ sh sb.sh --uninstall      # Stop and remove the installation
 
 ## Client configs
 
-Files are written to `/root/sing-box` and contain credentials, so copy them over a secure channel. Re-running the installer changes the credentials, so copy them again afterwards.
+Files are written to `/root/sing-box` and contain credentials, so copy them over a secure channel. Re-running the installer keeps the credentials.
 
 | File | Use with |
 | --- | --- | 
