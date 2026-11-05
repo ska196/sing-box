@@ -37,6 +37,20 @@ CONF_FILE="$CONF_DIR/config.json"
 REALITY_PUBLIC_FILE="$CONF_DIR/reality-public.key"
 TLS_CERT_FILE="$CONF_DIR/tls-cert.pem"
 TLS_KEY_FILE="$CONF_DIR/tls-key.pem"
+CLIENT_FILES="clash-pc.yaml clash-mobile.yaml singbox-pc.json singbox-android.json singbox-ios.json egern.yaml"
+# Older installs kept the client configs in this folder.
+OLD_CLIENT_DIR="$BASE_DIR/client"
+
+# Left unbounded, the Go heap and socket buffers can crowd out the page cache that
+# holds sing-box's own large binary, and the kernel then thrashes and OOM-kills it.
+# 4 MiB per socket carries about 250 Mbit/s on one TCP connection at 90 ms. At 8 MiB,
+# a dozen busy sockets took 90 MiB and got sing-box OOM-killed in a 128 MB container.
+GO_MEMORY_LIMIT=48MiB
+TCP_BUFFER_MAX=4194304
+
+SERVER=""
+SERVER_IPV4=""
+SERVER_IPV6=""
 
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
   C_RESET=$(printf '\033[0m'); C_OK=$(printf '\033[32m')
@@ -65,7 +79,13 @@ Installs sing-box and starts five inbounds with random credentials:
 Usage:
   ./sb6.sh              install (or repair) and start
   ./sb6.sh --show       print the share links for an existing install
+  ./sb6.sh --client-config
+                        write Clash, sing-box and Egern client configs
   ./sb6.sh --uninstall  stop and remove everything this script created
+
+Client configs send China and LAN traffic direct and everything else through
+the proxy, with 223.5.5.5 as DNS. They contain credentials and are written to
+the state directory; an install rewrites them.
 
 Prefers IPv6 for DNS resolution, outbound domains and client links, with IPv4 fallback.
 Clients must have IPv6 connectivity to use the generated IPv6 server address.
@@ -88,14 +108,16 @@ MODE=install
 case "${1:-}" in
   ""|--install)         MODE=install ;;
   --show)               MODE=show ;;
+  --client-config)      MODE=client-config ;;
   --uninstall|--remove) MODE=uninstall ;;
   -h|--help)            usage; exit 0 ;;
-  *) die "unknown option: $1 (try --show or --uninstall)" ;;
+  *) die "unknown option: $1 (try --show, --client-config or --uninstall)" ;;
 esac
 
-if [ "$MODE" != show ]; then
-  [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
-fi
+case "$MODE" in
+  show|client-config) ;;
+  *) [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)" ;;
+esac
 
 DISTRO=unknown
 if [ -r /etc/os-release ]; then
@@ -277,7 +299,7 @@ write_config() (
   jq . > "$CONF_FILE" << CONFIG
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
   },
   "dns": {
@@ -436,6 +458,13 @@ check_reality_dest() {
   esac
 }
 
+# Runs before every start because a container restart resets these settings. Writes
+# fail harmlessly where /proc/sys is read-only. Limiting unsent data drops the queue
+# that builds when a fast download outruns the client, leaving data in flight alone.
+# 1 MiB keeps the socket sending while a CPU quota has sing-box paused.
+# The values come from cat because the kernel returns EOF to byte-wise shell reads.
+TUNE_COMMAND='for f in /proc/sys/net/ipv4/tcp_rmem /proc/sys/net/ipv4/tcp_wmem; do set -- $(cat "$f" 2>/dev/null); [ "$#" -eq 3 ] && [ "$3" -gt '"$TCP_BUFFER_MAX"' ] && { echo "$1 $2 '"$TCP_BUFFER_MAX"'" > "$f"; } 2>/dev/null; done; { echo 1048576 > /proc/sys/net/ipv4/tcp_notsent_lowat; } 2>/dev/null; :'
+
 rotate_logs() {
   [ -f "$LOG_FILE" ] || return 0
   size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
@@ -503,7 +532,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/sh -c '$(printf '%s' "$TUNE_COMMAND" | sed 's/\$/$$/g')'
 ExecStart=$BIN_PATH run -c $CONF_FILE
+Environment=GOMEMLIMIT=$GO_MEMORY_LIMIT
+Environment=GODEBUG=disablethp=1
 Restart=always
 RestartSec=3s
 LimitNOFILE=infinity
@@ -523,7 +555,9 @@ UNIT
           -e "s|@LOG@|$LOG_FILE|g" \
           -e "s|@RPID@|$ROTATOR_PID_FILE|g" \
           -e "s|@RMAX@|$LOG_MAX_BYTES|g" \
-          -e "s|@RKEEP@|$LOG_KEEP_BYTES|g" > "/etc/init.d/$SERVICE_NAME" << 'INITD'
+          -e "s|@RKEEP@|$LOG_KEEP_BYTES|g" \
+          -e "s|@TUNE@|$(printf '%s' "$TUNE_COMMAND" | sed 's/[&\\|]/\\&/g')|g" \
+          -e "s|@GOMEMLIMIT@|$GO_MEMORY_LIMIT|g" > "/etc/init.d/$SERVICE_NAME" << 'INITD'
 #!/sbin/openrc-run
 
 name="sing-box"
@@ -537,9 +571,13 @@ error_log="@LOG@"
 respawn_delay=3
 respawn_max=0
 
+export GOMEMLIMIT="@GOMEMLIMIT@"
+export GODEBUG="disablethp=1"
+
 rotator_pid="@RPID@"
 
 start_pre() {
+  @TUNE@
   if [ -f "$rotator_pid" ] && kill -0 "$(cat "$rotator_pid")" 2>/dev/null; then
     return 0
   fi
@@ -587,7 +625,8 @@ start_service() {
     systemd) systemctl start "$SERVICE_NAME" ;;
     openrc)  rc-service "$SERVICE_NAME" start >/dev/null 2>&1 ;;
     none)
-      nohup sh -c '
+      sh -c "$TUNE_COMMAND" || :
+      GOMEMLIMIT="$GO_MEMORY_LIMIT" GODEBUG=disablethp=1 nohup sh -c '
         trap "kill \$child 2>/dev/null; wait \$child; exit 0" TERM
         while :; do
           "$1" run -c "$2" >>"$3" 2>&1 &
@@ -662,11 +701,16 @@ print_section() {
   printf '\n%s%s%s%s\n' "$C_BOLD" "$section_head" "$section_rule" "$C_RESET"
 }
 
-show_links() {
-  load_credentials
+detect_server() {
+  [ -z "$SERVER" ] || return 0
   SERVER_IPV6=$(public_ipv6) || SERVER_IPV6=""
   SERVER_IPV4=$(public_ip) || SERVER_IPV4=""
   SERVER="${SERVER_IPV6:-${SERVER_IPV4:-<your-server-ip>}}"
+}
+
+show_links() {
+  load_credentials
+  detect_server
   URI_SERVER=$SERVER
   case "$URI_SERVER" in
     *:*) URI_SERVER="[$URI_SERVER]" ;;
@@ -715,6 +759,515 @@ show_links() {
   printf '\n%s========================================================%s\n\n' "$C_BOLD" "$C_RESET"
 }
 
+# Real IPs for China and LAN answers from 223.5.5.5, fake IPs for everything else,
+# so proxied traffic keeps its domain and is resolved on the server. A route
+# "resolve" action cannot do this: it hands the proxy the possibly poisoned IP.
+# An empty AAAA answer is returned as is, or an IPv4-only China site would get a
+# fake IPv6 address and could end up on the proxy. $1 adds platform differences.
+singbox_client_config() {
+  jq "$1" << CONFIG
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns-ali",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fake",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": ["lan", "local", "home.arpa"],
+        "server": "dns-local"
+      },
+      {
+        "query_type": ["HTTPS", "SVCB"],
+        "action": "predefined"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "action": "evaluate",
+        "server": "dns-ali"
+      },
+      {
+        "match_response": true,
+        "rule_set": "geoip-cn",
+        "action": "respond"
+      },
+      {
+        "match_response": true,
+        "ip_is_private": true,
+        "action": "respond"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "query_type": "AAAA"
+          },
+          {
+            "match_response": true,
+            "response_rcode": "NOERROR"
+          },
+          {
+            "match_response": true,
+            "ip_accept_any": true,
+            "invert": true
+          }
+        ],
+        "action": "respond"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "server": "dns-fake"
+      }
+    ],
+    "final": "dns-ali"
+  },
+  "http_clients": [
+    {
+      "tag": "via-proxy",
+      "detour": "PROXY"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "PROXY",
+      "outbounds": ["reality", "hysteria2", "tuic", "snell-v5", "snell-v6"],
+      "default": "reality"
+    },
+    {
+      "type": "vless",
+      "tag": "reality",
+      "server": "$SERVER",
+      "server_port": $VLESS_PORT,
+      "uuid": "$VLESS_UUID",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "$REALITY_PUBLIC",
+          "short_id": "$REALITY_SHORT_ID"
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2",
+      "server": "$SERVER",
+      "server_port": $HY2_PORT,
+      "password": "$HY2_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "insecure": true,
+        "alpn": ["h3"]
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic",
+      "server": "$SERVER",
+      "server_port": $TUIC_PORT,
+      "uuid": "$VLESS_UUID",
+      "password": "$HY2_PASSWORD",
+      "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "insecure": true,
+        "alpn": ["h3"]
+      }
+    },
+    {
+      "type": "snell",
+      "tag": "snell-v5",
+      "server": "$SERVER",
+      "server_port": $SNELL_PORT,
+      "version": 4,
+      "psk": "$SNELL_PSK",
+      "reuse": true
+    },
+    {
+      "type": "snell",
+      "tag": "snell-v6",
+      "server": "$SERVER",
+      "server_port": $SNELL_V6_PORT,
+      "version": 6,
+      "psk": "$SNELL_PSK",
+      "reuse": true
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+      }
+    ],
+    "final": "PROXY",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-ali",
+    "default_http_client": "via-proxy"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "store_fakeip": true
+    }
+  }
+}
+CONFIG
+}
+
+# Sends LAN traffic around the TUN so devices on the LAN can reach this one.
+# 172.19.0.0/16 stays routed because it holds the TUN's own address.
+SINGBOX_LAN_ROUTES='.inbounds[0].route_exclude_address = [
+  "10.0.0.0/8", "169.254.0.0/16", "172.16.0.0/15", "172.18.0.0/16",
+  "172.20.0.0/14", "172.24.0.0/13", "192.168.0.0/16"
+]'
+
+singbox_client_pc() {
+  singbox_client_config "$SINGBOX_LAN_ROUTES | .inbounds[0].strict_route = true"
+}
+
+singbox_client_android() {
+  singbox_client_config "$SINGBOX_LAN_ROUTES"
+}
+
+singbox_client_ios() {
+  singbox_client_config .
+}
+
+# mihomo has no Snell v6 client, so that node is left out.
+clash_client_common() {
+  cat << CONFIG
+# Written by sb6.sh. Contains credentials, so keep this file private.
+mode: rule
+log-level: warning
+ipv6: true
+profile:
+  store-selected: true
+  store-fake-ip: true
+geo-auto-update: true
+geo-update-interval: 168
+geox-url:
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb"
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.home.arpa"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - 223.5.5.5
+  nameserver-policy:
+    "+.lan": system
+    "+.local": system
+    "+.home.arpa": system
+proxies:
+  - name: reality
+    type: vless
+    server: "$SERVER"
+    port: $VLESS_PORT
+    uuid: "$VLESS_UUID"
+    flow: xtls-rprx-vision
+    packet-encoding: xudp
+    udp: true
+    tls: true
+    servername: "$SNI"
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "$REALITY_PUBLIC"
+      short-id: "$REALITY_SHORT_ID"
+  - name: hysteria2
+    type: hysteria2
+    server: "$SERVER"
+    port: $HY2_PORT
+    password: "$HY2_PASSWORD"
+    sni: "$SNI"
+    skip-cert-verify: true
+    alpn:
+      - h3
+  - name: tuic
+    type: tuic
+    server: "$SERVER"
+    port: $TUIC_PORT
+    uuid: "$VLESS_UUID"
+    password: "$HY2_PASSWORD"
+    congestion-controller: bbr
+    udp-relay-mode: native
+    sni: "$SNI"
+    skip-cert-verify: true
+    alpn:
+      - h3
+  - name: snell-v5
+    type: snell
+    server: "$SERVER"
+    port: $SNELL_PORT
+    psk: "$SNELL_PSK"
+    version: 4
+    udp: true
+    reuse: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - reality
+      - hysteria2
+      - tuic
+      - snell-v5
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,169.254.0.0/16,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR6,::1/128,DIRECT
+  - IP-CIDR6,fc00::/7,DIRECT
+  - IP-CIDR6,fe80::/10,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+CONFIG
+}
+
+clash_client_pc() {
+  clash_client_common
+  cat << 'CONFIG'
+mixed-port: 7890
+tun:
+  enable: true
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  route-exclude-address:
+    - 10.0.0.0/8
+    - 169.254.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+CONFIG
+}
+
+# No local proxy port: other apps on a phone could find and use it.
+clash_client_mobile() {
+  clash_client_common
+  cat << 'CONFIG'
+find-process-mode: "off"
+tun:
+  enable: true
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+CONFIG
+}
+
+# Egern has no Snell v6 client, and is only available on Apple devices.
+egern_client() {
+  cat << CONFIG
+# Written by sb6.sh. Contains credentials, so keep this file private.
+ipv6: true
+hijack_dns:
+  - "*"
+real_ip_domains:
+  - "*.lan"
+  - "*.local"
+  - "*.home.arpa"
+dns:
+  bootstrap:
+    - 223.5.5.5
+  forward:
+    - domain_suffix:
+        match: lan
+        value: system
+    - domain_suffix:
+        match: local
+        value: system
+    - domain_suffix:
+        match: home.arpa
+        value: system
+proxies:
+  - vless:
+      name: reality
+      server: "$SERVER"
+      port: $VLESS_PORT
+      user_id: "$VLESS_UUID"
+      flow: xtls-rprx-vision
+      udp_relay: true
+      transport:
+        tls:
+          sni: "$SNI"
+          reality:
+            public_key: "$REALITY_PUBLIC"
+            short_id: "$REALITY_SHORT_ID"
+  - hysteria2:
+      name: hysteria2
+      server: "$SERVER"
+      port: $HY2_PORT
+      auth: "$HY2_PASSWORD"
+      sni: "$SNI"
+      skip_tls_verify: true
+  - tuic:
+      name: tuic
+      server: "$SERVER"
+      port: $TUIC_PORT
+      uuid: "$VLESS_UUID"
+      password: "$HY2_PASSWORD"
+      udp_relay_mode: native
+      alpn:
+        - h3
+      sni: "$SNI"
+      skip_tls_verify: true
+  - snell:
+      name: snell-v5
+      server: "$SERVER"
+      port: $SNELL_PORT
+      psk: "$SNELL_PSK"
+      version: 4
+      udp_relay: true
+      reuse: true
+policy_groups:
+  - select:
+      name: PROXY
+      policies:
+        - reality
+        - hysteria2
+        - tuic
+        - snell-v5
+rules:
+  - ip_cidr:
+      match: 10.0.0.0/8
+      policy: DIRECT
+  - ip_cidr:
+      match: 127.0.0.0/8
+      policy: DIRECT
+  - ip_cidr:
+      match: 169.254.0.0/16
+      policy: DIRECT
+  - ip_cidr:
+      match: 172.16.0.0/12
+      policy: DIRECT
+  - ip_cidr:
+      match: 192.168.0.0/16
+      policy: DIRECT
+  - ip_cidr6:
+      match: "::1/128"
+      policy: DIRECT
+  - ip_cidr6:
+      match: "fc00::/7"
+      policy: DIRECT
+  - ip_cidr6:
+      match: "fe80::/10"
+      policy: DIRECT
+  - geoip:
+      match: CN
+      policy: DIRECT
+  - default:
+      policy: PROXY
+CONFIG
+}
+
+write_client_file() {
+  client_file="$BASE_DIR/$1"
+  touch "$client_file" && chmod 600 "$client_file" || die "could not create $client_file"
+  "$2" > "$client_file" || die "could not write $client_file"
+}
+
+write_client_configs() {
+  load_credentials
+  detect_server
+  if [ "$SERVER" = "<your-server-ip>" ]; then
+    warn "could not detect this server's public IP; client configs were not written"
+    return 1
+  fi
+  (
+    umask 077
+    write_client_file clash-pc.yaml clash_client_pc
+    write_client_file clash-mobile.yaml clash_client_mobile
+    write_client_file singbox-pc.json singbox_client_pc
+    write_client_file singbox-android.json singbox_client_android
+    write_client_file singbox-ios.json singbox_client_ios
+    write_client_file egern.yaml egern_client
+    rm -rf "$OLD_CLIENT_DIR"
+  ) || return 1
+
+  printf '%s========================================================%s\n' "$C_BOLD" "$C_RESET"
+  printf '%s  Config files%s\n' "$C_BOLD" "$C_RESET"
+  printf '%s========================================================%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s\n\n' "$BASE_DIR"
+  printf '  Clash (PC/Mac)       clash-pc.yaml\n'
+  printf '  Clash (Android/iOS)  clash-mobile.yaml\n'
+  printf '  sing-box (PC/Mac)    singbox-pc.json\n'
+  printf '  sing-box (Android)   singbox-android.json\n'
+  printf '  sing-box (iOS)       singbox-ios.json\n'
+  printf '  Egern (Apple)        egern.yaml\n\n'
+}
+
 uninstall() {
   log "stopping and removing sing-box"
   case "$INIT" in
@@ -735,7 +1288,10 @@ uninstall() {
     rm -f "$PID_FILE"
   fi
   stop_rotator
-  rm -rf "$CONF_DIR" "$LOG_DIR" "$BIN_PATH" "$PID_FILE" "$ROTATOR_PID_FILE" "$BASE_DIR"/dl.*
+  rm -rf "$CONF_DIR" "$OLD_CLIENT_DIR" "$LOG_DIR" "$BIN_PATH" "$PID_FILE" "$ROTATOR_PID_FILE" "$BASE_DIR"/dl.*
+  for client_file in $CLIENT_FILES; do
+    rm -f "$BASE_DIR/$client_file"
+  done
   rmdir "$BASE_DIR" 2>/dev/null || true
   ok "removed sing-box, its configuration, and its service"
 }
@@ -761,6 +1317,7 @@ do_install() {
   ok "configuration validated"
 
   check_reality_dest
+  rm -f "$CONF_DIR/tune.sh"
 
   stop_existing
   install_service
@@ -768,6 +1325,7 @@ do_install() {
   start_service
   verify_listening
   show_links
+  write_client_configs || warn "client configs were not written; try: $0 --client-config"
 }
 
 case "$MODE" in
@@ -775,6 +1333,10 @@ case "$MODE" in
   show)
     [ -f "$CONF_FILE" ] || die "no installation found at $CONF_FILE"
     show_links
+    ;;
+  client-config)
+    [ -f "$CONF_FILE" ] || die "no installation found at $CONF_FILE"
+    write_client_configs || exit 1
     ;;
   uninstall) uninstall ;;
 esac
