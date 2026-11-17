@@ -902,6 +902,13 @@ singbox_client_config() {
           "public_key": "$REALITY_PUBLIC",
           "short_id": "$REALITY_SHORT_ID"
         }
+      },
+      "multiplex": {
+        "enabled": true,
+        "protocol": "h2mux",
+        "max_connections": 4,
+        "min_streams": 4,
+        "padding": true
       }
     },
     {
@@ -1064,6 +1071,12 @@ proxies:
     reality-opts:
       public-key: "$REALITY_PUBLIC"
       short-id: "$REALITY_SHORT_ID"
+    smux:
+      enabled: true
+      protocol: h2mux
+      max-connections: 4
+      min-streams: 4
+      padding: true
   - name: hysteria2
     type: hysteria2
     server: "$SERVER"

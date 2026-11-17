@@ -46,3 +46,8 @@ Files are written to `/root/sing-box` and contain credentials, so copy them over
 | `singbox-android.json` | sing-box 1.14+ (Android) |
 | `singbox-ios.json` | sing-box 1.14+ (iOS) |
 | `egern.yaml` | Egern (Apple devices) |
+
+The sing-box and Clash configs multiplex REALITY traffic (h2mux with padding), normally over 4 TCP connections at most. Two cases don't get multiplexing:
+
+- **Egern** has no multiplex option for VLESS, so it opens one TCP connection to the server for every proxied connection.
+- **`vless://` links** have no multiplex field in the [share-link standard](https://github.com/XTLS/Xray-core/discussions/716). After importing one, turn multiplex on in the client yourself (h2mux, padding on). The server accepts connections with or without multiplex.
