@@ -372,6 +372,7 @@ write_config() (
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": 60002,
+      "ignore_client_bandwidth": true,
       "users": [
         {
           "name": "default",
